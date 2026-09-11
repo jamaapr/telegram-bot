@@ -1,20 +1,25 @@
 import os
 import re
+import logging
 from datetime import datetime, timezone
 import requests
 import telebot
 from telebot import types
 from flask import Flask, request
 
-TOKEN = "8966729910:AAECEcUt0JREMxTYKDzH1wk65A2Ffj6324o"
-RENDER_URL = "https://telegram-bot-production-7d43.up.railway.app"
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("ValueX")
 
-bot = telebot.TeleBot(TOKEN)
+TOKEN = "8966729910:AAECEcUt0JREMxTYKDzH1wk65A2Ffj6324o"
+BASE_URL = "https://telegram-bot-production-7d43.up.railway.app"
+BRAND_NAME = "ValueX"
+
+bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 app = Flask(__name__)
 
 FIAT_CURRENCIES = ["USD", "EUR", "GBP", "MAD", "SAR", "AED", "JPY", "CNY"]
 
-CRYPTO_IDS = {
+CRYPTO_ASSETS = {
     "BTC": "bitcoin",
     "ETH": "ethereum",
     "USDT": "tether",
@@ -27,206 +32,280 @@ CRYPTO_IDS = {
     "TRX": "tron",
 }
 
+CURRENCY_FLAGS = {
+    "USD": "🇺🇸", "EUR": "🇪🇺", "GBP": "🇬🇧", "MAD": "🇲🇦",
+    "SAR": "🇸🇦", "AED": "🇦🇪", "JPY": "🇯🇵", "CNY": "🇨🇳",
+}
 
-def now_str():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+CALC_PATTERN = re.compile(r"^[\d\.\+\-\*\/\(\)\s]+$")
 
 
-def remove_old_keyboard(chat_id):
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+def timestamp():
+    return datetime.now(timezone.utc).strftime("%d %b %Y, %H:%M UTC")
+
+
+def divider():
+    return "─" * 24
+
+
+def safe_edit(call, text, markup=None):
     try:
-        bot.send_message(chat_id, "🔄 Updating...", reply_markup=types.ReplyKeyboardRemove())
-    except Exception:
-        pass
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.warning(f"Edit failed, sending new message instead: {e}")
+        bot.send_message(call.message.chat.id, text, reply_markup=markup)
 
 
-def main_menu():
+# ---------------------------------------------------------------------------
+# Keyboards
+# ---------------------------------------------------------------------------
+
+def kb_main():
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(
-        types.InlineKeyboardButton("💱 Fiat Currencies", callback_data="menu_fiat"),
-        types.InlineKeyboardButton("🪙 Crypto Currencies", callback_data="menu_crypto"),
+        types.InlineKeyboardButton("💱  Fiat Rates", callback_data="nav:fiat"),
+        types.InlineKeyboardButton("🪙  Crypto Prices", callback_data="nav:crypto"),
     )
     kb.add(
-        types.InlineKeyboardButton("🧮 Calculator", callback_data="menu_calc"),
-        types.InlineKeyboardButton("ℹ️ Help", callback_data="menu_help"),
+        types.InlineKeyboardButton("🧮  Calculator", callback_data="nav:calc"),
+        types.InlineKeyboardButton("ℹ️  About", callback_data="nav:about"),
     )
     return kb
 
 
-def fiat_menu():
+def kb_fiat_list():
     kb = types.InlineKeyboardMarkup(row_width=4)
-    kb.add(*[types.InlineKeyboardButton(c, callback_data=f"fiat_{c}") for c in FIAT_CURRENCIES])
-    kb.add(types.InlineKeyboardButton("⬅️ Main Menu", callback_data="menu_main"))
+    kb.add(*[
+        types.InlineKeyboardButton(f"{CURRENCY_FLAGS.get(c,'')} {c}", callback_data=f"fiat:{c}")
+        for c in FIAT_CURRENCIES
+    ])
+    kb.add(types.InlineKeyboardButton("🏠  Main Menu", callback_data="nav:main"))
     return kb
 
 
-def crypto_menu():
+def kb_crypto_list():
     kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(*[types.InlineKeyboardButton(c, callback_data=f"crypto_{c}") for c in CRYPTO_IDS])
-    kb.add(types.InlineKeyboardButton("⬅️ Main Menu", callback_data="menu_main"))
+    kb.add(*[types.InlineKeyboardButton(c, callback_data=f"crypto:{c}") for c in CRYPTO_ASSETS])
+    kb.add(types.InlineKeyboardButton("🏠  Main Menu", callback_data="nav:main"))
     return kb
 
 
-def back_button(target):
+def kb_result(back_target):
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    label = "🔁  Choose Another Currency" if back_target == "fiat" else "🔁  Choose Another Asset"
+    kb.add(types.InlineKeyboardButton(label, callback_data=f"nav:{back_target}"))
+    kb.add(types.InlineKeyboardButton("🏠  Main Menu", callback_data="nav:main"))
+    return kb
+
+
+def kb_back_main():
     kb = types.InlineKeyboardMarkup()
-    label = "⬅️ Back to Fiat" if target == "fiat" else "⬅️ Back to Crypto"
-    kb.add(types.InlineKeyboardButton(label, callback_data=f"menu_{target}"))
-    kb.add(types.InlineKeyboardButton("🏠 Main Menu", callback_data="menu_main"))
+    kb.add(types.InlineKeyboardButton("🏠  Main Menu", callback_data="nav:main"))
     return kb
 
 
-def build_fiat_message(base):
-    data = requests.get(f"https://open.er-api.com/v6/latest/{base}", timeout=10).json()
-    rates = data["rates"]
-    lines = [f"💱 <b>{base} Exchange Rates</b>", f"🕒 {now_str()}", ""]
+# ---------------------------------------------------------------------------
+# Data fetchers
+# ---------------------------------------------------------------------------
+
+def fetch_fiat_rates(base):
+    r = requests.get(f"https://open.er-api.com/v6/latest/{base}", timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("result") != "success":
+        raise ValueError("API returned an error")
+    return data["rates"]
+
+
+def fetch_crypto_price(symbol):
+    coin_id = CRYPTO_ASSETS[symbol]
+    r = requests.get(
+        "https://api.coingecko.com/api/v3/simple/price",
+        params={
+            "ids": coin_id,
+            "vs_currencies": "usd,eur,mad",
+            "include_24hr_change": "true",
+        },
+        timeout=10,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if coin_id not in data:
+        raise ValueError("Asset not found")
+    return data[coin_id]
+
+
+# ---------------------------------------------------------------------------
+# Message builders
+# ---------------------------------------------------------------------------
+
+def welcome_text(name):
+    return (
+        f"<b>Welcome to {BRAND_NAME}, {name}.</b>\n"
+        f"{divider()}\n"
+        "Your real-time companion for currency exchange rates "
+        "and cryptocurrency prices.\n\n"
+        "Select an option below to get started."
+    )
+
+
+def about_text():
+    return (
+        f"<b>{BRAND_NAME}</b>\n"
+        f"{divider()}\n"
+        "A lightweight financial data assistant.\n\n"
+        "💱  <b>Fiat Rates</b> — live exchange rates for 8 major currencies.\n"
+        "🪙  <b>Crypto Prices</b> — live prices for the 10 most traded assets.\n"
+        "🧮  <b>Calculator</b> — quick arithmetic, no app switching.\n\n"
+        "All data is fetched live at the moment of your request."
+    )
+
+
+def calc_text():
+    return (
+        "<b>Calculator</b>\n"
+        f"{divider()}\n"
+        "Send any arithmetic expression directly in the chat, for example:\n\n"
+        "<code>250 * 4</code>\n"
+        "<code>(120 + 80) / 2</code>\n"
+        "<code>15 ** 2</code>"
+    )
+
+
+def fiat_result_text(base, rates):
+    lines = [
+        f"<b>{CURRENCY_FLAGS.get(base,'')} {base} — Exchange Rates</b>",
+        f"🕒 {timestamp()}",
+        divider(),
+    ]
     for c in FIAT_CURRENCIES:
         if c == base:
             continue
-        lines.append(f"1 {base} = <b>{rates[c]:.4f}</b> {c}")
+        flag = CURRENCY_FLAGS.get(c, "")
+        lines.append(f"{flag} 1 {base}  =  <b>{rates[c]:.4f}</b> {c}")
     return "\n".join(lines)
 
 
-def build_crypto_message(symbol):
-    coin_id = CRYPTO_IDS[symbol]
-    data = requests.get(
-        "https://api.coingecko.com/api/v3/simple/price",
-        params={"ids": coin_id, "vs_currencies": "usd,eur,mad", "include_24hr_change": "true"},
-        timeout=10,
-    ).json()
-    info = data[coin_id]
-    change = info.get("usd_24h_change", 0)
-    arrow = "🟢" if change >= 0 else "🔴"
+def crypto_result_text(symbol, info):
+    change = info.get("usd_24h_change", 0.0)
+    trend = "🟢 ▲" if change >= 0 else "🔴 ▼"
     lines = [
-        f"🪙 <b>{symbol} Price</b>",
-        f"🕒 {now_str()}",
-        "",
-        f"💵 {info['usd']:.4f} USD",
-        f"💶 {info.get('eur', 0):.4f} EUR",
-        f"🇲🇦 {info.get('mad', 0):.2f} MAD",
-        "",
-        f"{arrow} 24h Change: {change:.2f}%",
+        f"<b>🪙 {symbol} — Live Price</b>",
+        f"🕒 {timestamp()}",
+        divider(),
+        f"💵  {info['usd']:,.4f} USD",
+        f"💶  {info.get('eur', 0):,.4f} EUR",
+        f"🇲🇦  {info.get('mad', 0):,.2f} MAD",
+        divider(),
+        f"{trend}  24h change: {change:.2f}%",
     ]
     return "\n".join(lines)
 
 
+def error_text(context):
+    return (
+        f"⚠️ <b>Temporarily unavailable</b>\n"
+        f"We couldn't fetch {context} right now. Please try again in a moment."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Handlers
+# ---------------------------------------------------------------------------
+
 @bot.message_handler(commands=["start"])
-def start(message):
-    remove_old_keyboard(message.chat.id)
+def handle_start(message):
     bot.send_message(
         message.chat.id,
-        "👋 <b>Welcome!</b>\nChoose an option below:",
-        parse_mode="HTML",
-        reply_markup=main_menu(),
+        welcome_text(message.from_user.first_name or "there"),
+        reply_markup=kb_main(),
     )
 
 
-@bot.callback_query_handler(func=lambda c: c.data == "menu_main")
-def cb_main(call):
-    bot.edit_message_text(
-        "👋 <b>Welcome!</b>\nChoose an option below:",
-        call.message.chat.id,
-        call.message.message_id,
-        parse_mode="HTML",
-        reply_markup=main_menu(),
-    )
+@bot.callback_query_handler(func=lambda c: c.data == "nav:main")
+def nav_main(call):
+    safe_edit(call, welcome_text(call.from_user.first_name or "there"), kb_main())
 
 
-@bot.callback_query_handler(func=lambda c: c.data == "menu_fiat")
-def cb_fiat_menu(call):
-    bot.edit_message_text(
-        "💱 <b>Select a base currency:</b>",
-        call.message.chat.id,
-        call.message.message_id,
-        parse_mode="HTML",
-        reply_markup=fiat_menu(),
-    )
+@bot.callback_query_handler(func=lambda c: c.data == "nav:fiat")
+def nav_fiat(call):
+    safe_edit(call, "<b>💱 Select a base currency</b>", kb_fiat_list())
 
 
-@bot.callback_query_handler(func=lambda c: c.data == "menu_crypto")
-def cb_crypto_menu(call):
-    bot.edit_message_text(
-        "🪙 <b>Select a cryptocurrency:</b>",
-        call.message.chat.id,
-        call.message.message_id,
-        parse_mode="HTML",
-        reply_markup=crypto_menu(),
-    )
+@bot.callback_query_handler(func=lambda c: c.data == "nav:crypto")
+def nav_crypto(call):
+    safe_edit(call, "<b>🪙 Select a cryptocurrency</b>", kb_crypto_list())
 
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("fiat_"))
-def cb_show_fiat(call):
-    base = call.data.split("_")[1]
+@bot.callback_query_handler(func=lambda c: c.data == "nav:calc")
+def nav_calc(call):
+    safe_edit(call, calc_text(), kb_back_main())
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "nav:about")
+def nav_about(call):
+    safe_edit(call, about_text(), kb_back_main())
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("fiat:"))
+def show_fiat(call):
+    base = call.data.split(":")[1]
     try:
-        text = build_fiat_message(base)
-    except Exception:
-        text = "⚠️ Could not fetch rates right now. Please try again."
-    bot.edit_message_text(
-        text, call.message.chat.id, call.message.message_id,
-        parse_mode="HTML", reply_markup=back_button("fiat"),
-    )
+        rates = fetch_fiat_rates(base)
+        text = fiat_result_text(base, rates)
+    except Exception as e:
+        logger.error(f"Fiat fetch failed: {e}")
+        text = error_text("exchange rates")
+    safe_edit(call, text, kb_result("fiat"))
 
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("crypto_"))
-def cb_show_crypto(call):
-    symbol = call.data.split("_")[1]
+@bot.callback_query_handler(func=lambda c: c.data.startswith("crypto:"))
+def show_crypto(call):
+    symbol = call.data.split(":")[1]
     try:
-        text = build_crypto_message(symbol)
-    except Exception:
-        text = "⚠️ Could not fetch price right now. Please try again."
-    bot.edit_message_text(
-        text, call.message.chat.id, call.message.message_id,
-        parse_mode="HTML", reply_markup=back_button("crypto"),
-    )
-
-
-@bot.callback_query_handler(func=lambda c: c.data == "menu_calc")
-def cb_calc(call):
-    bot.edit_message_text(
-        "🧮 <b>Calculator</b>\n\nSend me a calculation, e.g.:\n<code>50 * 12</code>\n<code>(100 + 250) / 2</code>",
-        call.message.chat.id,
-        call.message.message_id,
-        parse_mode="HTML",
-        reply_markup=types.InlineKeyboardMarkup().add(
-            types.InlineKeyboardButton("⬅️ Main Menu", callback_data="menu_main")
-        ),
-    )
-
-
-@bot.callback_query_handler(func=lambda c: c.data == "menu_help")
-def cb_help(call):
-    bot.edit_message_text(
-        "ℹ️ <b>How to use this bot</b>\n\n"
-        "💱 <b>Fiat Currencies</b> — tap a currency to see live exchange rates.\n"
-        "🪙 <b>Crypto Currencies</b> — tap a coin to see its live price.\n"
-        "🧮 <b>Calculator</b> — send any math expression directly.\n\n"
-        "All data updates live each time you check it.",
-        call.message.chat.id,
-        call.message.message_id,
-        parse_mode="HTML",
-        reply_markup=types.InlineKeyboardMarkup().add(
-            types.InlineKeyboardButton("⬅️ Main Menu", callback_data="menu_main")
-        ),
-    )
-
-
-CALC_RE = re.compile(r"^[\d\.\+\-\*\/\(\)\s]+$")
+        info = fetch_crypto_price(symbol)
+        text = crypto_result_text(symbol, info)
+    except Exception as e:
+        logger.error(f"Crypto fetch failed: {e}")
+        text = error_text("this asset's price")
+    safe_edit(call, text, kb_result("crypto"))
 
 
 @bot.message_handler(func=lambda m: True, content_types=["text"])
 def handle_text(message):
     text = message.text.strip()
-    if CALC_RE.match(text) and any(ch.isdigit() for ch in text):
+
+    if CALC_PATTERN.match(text) and any(ch.isdigit() for ch in text):
         try:
             result = eval(text, {"__builtins__": {}}, {})
-            bot.send_message(message.chat.id, f"🧮 <code>{text}</code> = <b>{result}</b>", parse_mode="HTML")
+            bot.send_message(
+                message.chat.id,
+                f"🧮 <code>{text}</code>  =  <b>{result}</b>",
+            )
         except Exception:
-            bot.send_message(message.chat.id, "⚠️ Invalid expression.")
+            bot.send_message(message.chat.id, "⚠️ That expression couldn't be calculated.")
         return
+
     bot.send_message(
         message.chat.id,
-        "👋 Choose an option below:",
-        reply_markup=main_menu(),
+        welcome_text(message.from_user.first_name or "there"),
+        reply_markup=kb_main(),
     )
 
+
+# ---------------------------------------------------------------------------
+# Flask routes
+# ---------------------------------------------------------------------------
 
 @app.route(f"/{TOKEN}", methods=["POST"])
 def webhook():
@@ -237,10 +316,10 @@ def webhook():
 
 
 @app.route("/", methods=["GET"])
-def set_webhook():
+def index():
     bot.remove_webhook()
-    bot.set_webhook(url=f"{RENDER_URL}/{TOKEN}")
-    return "Webhook set!", 200
+    bot.set_webhook(url=f"{BASE_URL}/{TOKEN}")
+    return f"{BRAND_NAME} — Webhook set successfully.", 200
 
 
 if __name__ == "__main__":
