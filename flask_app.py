@@ -1,149 +1,158 @@
 import os
 import re
+from datetime import datetime, timezone
 import requests
 import telebot
 from telebot import types
 from flask import Flask, request
 
 TOKEN = "8966729910:AAECEcUt0JREMxTYKDzH1wk65A2Ffj6324o"
+RENDER_URL = "https://telegram-bot-production-7d43.up.railway.app"
+
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
 
-user_lang = {}
-
-TEXT = {
-    "ar": {
-        "welcome": "أهلاً بك! اختر من القائمة:",
-        "menu_convert": "💱 تحويل العملات",
-        "menu_calc": "🧮 حاسبة سريعة",
-        "menu_rates": "📊 أسعار اليوم",
-        "menu_lang": "🌐 تغيير اللغة",
-        "convert_help": "أرسل مثلاً: 100 USD MAD",
-        "calc_help": "أرسل عملية حسابية مثلاً: 50 * 12",
-        "rate_result": "💱 1 {frm} = {rate} {to}\nالنتيجة: {amount} {frm} = {result} {to}",
-        "error": "⚠️ حدث خطأ، تأكد من الصيغة.",
-        "rates_title": "📊 أسعار اليوم مقابل الدرهم المغربي:",
-    },
-    "en": {
-        "welcome": "Welcome! Choose from the menu:",
-        "menu_convert": "💱 Currency Converter",
-        "menu_calc": "🧮 Quick Calculator",
-        "menu_rates": "📊 Today's Rates",
-        "menu_lang": "🌐 Change Language",
-        "convert_help": "Send e.g.: 100 USD MAD",
-        "calc_help": "Send a calculation e.g.: 50 * 12",
-        "rate_result": "💱 1 {frm} = {rate} {to}\nResult: {amount} {frm} = {result} {to}",
-        "error": "⚠️ Error, check the format.",
-        "rates_title": "📊 Today's rates vs Moroccan Dirham:",
-    },
-}
+MAIN_CURRENCIES = ["USD", "EUR", "GBP", "MAD", "SAR", "AED", "JPY", "CNY"]
 
 
-def lang_of(chat_id):
-    return user_lang.get(chat_id, "ar")
+def now_str():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
-def main_menu(chat_id):
-    t = TEXT[lang_of(chat_id)]
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(t["menu_convert"], t["menu_calc"])
-    kb.row(t["menu_rates"], t["menu_lang"])
-    return kb
-
-
-def lang_keyboard():
-    kb = types.InlineKeyboardMarkup()
-    kb.row(
-        types.InlineKeyboardButton("🇲🇦 العربية", callback_data="setlang_ar"),
-        types.InlineKeyboardButton("🇬🇧 English", callback_data="setlang_en"),
+def main_menu():
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("💱 Currency Rates", callback_data="menu_rates"),
+        types.InlineKeyboardButton("🧮 Calculator", callback_data="menu_calc"),
     )
+    kb.add(types.InlineKeyboardButton("ℹ️ Help", callback_data="menu_help"))
     return kb
+
+
+def currency_menu():
+    kb = types.InlineKeyboardMarkup(row_width=4)
+    buttons = [
+        types.InlineKeyboardButton(c, callback_data=f"rate_{c}")
+        for c in MAIN_CURRENCIES
+    ]
+    kb.add(*buttons)
+    kb.add(types.InlineKeyboardButton("⬅️ Back", callback_data="menu_main"))
+    return kb
+
+
+def back_to_rates_menu():
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("💱 Choose Another Currency", callback_data="menu_rates"))
+    kb.add(types.InlineKeyboardButton("⬅️ Main Menu", callback_data="menu_main"))
+    return kb
+
+
+def build_rates_message(base):
+    data = requests.get(f"https://open.er-api.com/v6/latest/{base}", timeout=10).json()
+    rates = data["rates"]
+    lines = [f"💱 <b>{base} Exchange Rates</b>", f"🕒 {now_str()}", ""]
+    for c in MAIN_CURRENCIES:
+        if c == base:
+            continue
+        lines.append(f"1 {base} = <b>{rates[c]:.4f}</b> {c}")
+    return "\n".join(lines)
 
 
 @bot.message_handler(commands=["start"])
 def start(message):
-    chat_id = message.chat.id
-    if chat_id not in user_lang:
-        bot.send_message(chat_id, "اختر لغتك / Choose language:", reply_markup=lang_keyboard())
-    else:
-        t = TEXT[lang_of(chat_id)]
-        bot.send_message(chat_id, t["welcome"], reply_markup=main_menu(chat_id))
+    bot.send_message(
+        message.chat.id,
+        "👋 <b>Welcome!</b>\nChoose an option below:",
+        parse_mode="HTML",
+        reply_markup=main_menu(),
+    )
 
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("setlang_"))
-def set_lang(call):
-    chat_id = call.message.chat.id
-    lang = call.data.split("_")[1]
-    user_lang[chat_id] = lang
-    t = TEXT[lang]
-    bot.send_message(chat_id, t["welcome"], reply_markup=main_menu(chat_id))
+@bot.callback_query_handler(func=lambda c: c.data == "menu_main")
+def cb_main(call):
+    bot.edit_message_text(
+        "👋 <b>Welcome!</b>\nChoose an option below:",
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="HTML",
+        reply_markup=main_menu(),
+    )
 
 
-@bot.message_handler(func=lambda m: m.text in [TEXT["ar"]["menu_lang"], TEXT["en"]["menu_lang"]])
-def change_lang(message):
-    bot.send_message(message.chat.id, "اختر لغتك / Choose language:", reply_markup=lang_keyboard())
+@bot.callback_query_handler(func=lambda c: c.data == "menu_rates")
+def cb_rates_menu(call):
+    bot.edit_message_text(
+        "💱 <b>Select a base currency:</b>",
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="HTML",
+        reply_markup=currency_menu(),
+    )
 
 
-@bot.message_handler(func=lambda m: m.text in [TEXT["ar"]["menu_convert"], TEXT["en"]["menu_convert"]])
-def ask_convert(message):
-    t = TEXT[lang_of(message.chat.id)]
-    bot.send_message(message.chat.id, t["convert_help"])
-
-
-@bot.message_handler(func=lambda m: m.text in [TEXT["ar"]["menu_calc"], TEXT["en"]["menu_calc"]])
-def ask_calc(message):
-    t = TEXT[lang_of(message.chat.id)]
-    bot.send_message(message.chat.id, t["calc_help"])
-
-
-@bot.message_handler(func=lambda m: m.text in [TEXT["ar"]["menu_rates"], TEXT["en"]["menu_rates"]])
-def today_rates(message):
-    chat_id = message.chat.id
-    t = TEXT[lang_of(chat_id)]
+@bot.callback_query_handler(func=lambda c: c.data.startswith("rate_"))
+def cb_show_rate(call):
+    base = call.data.split("_")[1]
     try:
-        data = requests.get("https://open.er-api.com/v6/latest/USD", timeout=10).json()
-        rates = data["rates"]
-        msg = f"{t['rates_title']}\n"
-        msg += f"1 USD = {rates['MAD']:.2f} MAD\n"
-        msg += f"1 EUR = {rates['MAD']/rates['EUR']:.2f} MAD\n"
-        msg += f"1 USD = {rates['EUR']:.4f} EUR"
-        bot.send_message(chat_id, msg)
+        text = build_rates_message(base)
     except Exception:
-        bot.send_message(chat_id, t["error"])
+        text = "⚠️ Could not fetch rates right now. Please try again."
+    bot.edit_message_text(
+        text,
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="HTML",
+        reply_markup=back_to_rates_menu(),
+    )
 
 
-CONVERT_RE = re.compile(r"^\s*([\d.]+)\s*([A-Za-z]{3})\s*([A-Za-z]{3})\s*$")
+@bot.callback_query_handler(func=lambda c: c.data == "menu_calc")
+def cb_calc(call):
+    bot.edit_message_text(
+        "🧮 <b>Calculator</b>\n\nSend me a calculation, e.g.:\n<code>50 * 12</code>\n<code>(100 + 250) / 2</code>",
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="HTML",
+        reply_markup=types.InlineKeyboardMarkup().add(
+            types.InlineKeyboardButton("⬅️ Main Menu", callback_data="menu_main")
+        ),
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "menu_help")
+def cb_help(call):
+    bot.edit_message_text(
+        "ℹ️ <b>How to use this bot</b>\n\n"
+        "💱 <b>Currency Rates</b> — tap a currency to instantly see live rates.\n"
+        "🧮 <b>Calculator</b> — send any math expression directly.\n\n"
+        "Rates are updated live each time you check them.",
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="HTML",
+        reply_markup=types.InlineKeyboardMarkup().add(
+            types.InlineKeyboardButton("⬅️ Main Menu", callback_data="menu_main")
+        ),
+    )
+
+
 CALC_RE = re.compile(r"^[\d\.\+\-\*\/\(\)\s]+$")
 
 
 @bot.message_handler(func=lambda m: True, content_types=["text"])
 def handle_text(message):
-    chat_id = message.chat.id
-    t = TEXT[lang_of(chat_id)]
     text = message.text.strip()
-
-    m = CONVERT_RE.match(text)
-    if m:
-        amount, frm, to = float(m.group(1)), m.group(2).upper(), m.group(3).upper()
-        try:
-            data = requests.get(f"https://open.er-api.com/v6/latest/{frm}", timeout=10).json()
-            rate = data["rates"][to]
-            result = round(amount * rate, 2)
-            bot.send_message(chat_id, t["rate_result"].format(
-                frm=frm, to=to, rate=round(rate, 4), amount=amount, result=result))
-        except Exception:
-            bot.send_message(chat_id, t["error"])
-        return
-
     if CALC_RE.match(text) and any(ch.isdigit() for ch in text):
         try:
             result = eval(text, {"__builtins__": {}}, {})
-            bot.send_message(chat_id, str(result))
+            bot.send_message(message.chat.id, f"🧮 <code>{text}</code> = <b>{result}</b>", parse_mode="HTML")
         except Exception:
-            bot.send_message(chat_id, t["error"])
+            bot.send_message(message.chat.id, "⚠️ Invalid expression.")
         return
-
-    bot.send_message(chat_id, t["welcome"], reply_markup=main_menu(chat_id))
+    bot.send_message(
+        message.chat.id,
+        "👋 Choose an option below:",
+        reply_markup=main_menu(),
+    )
 
 
 @app.route(f"/{TOKEN}", methods=["POST"])
@@ -157,7 +166,7 @@ def webhook():
 @app.route("/", methods=["GET"])
 def set_webhook():
     bot.remove_webhook()
-    bot.set_webhook(url=f"https://telegram-bot-production-7d43.up.railway.app/{TOKEN}")
+    bot.set_webhook(url=f"{RENDER_URL}/{TOKEN}")
     return "Webhook set!", 200
 
 
