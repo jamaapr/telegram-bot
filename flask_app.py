@@ -157,7 +157,7 @@ def webhook():
 @app.route("/", methods=["GET"])
 def set_webhook():
     bot.remove_webhook()
-    bot.set_webhook(url=f"https://telegram-bot-xxxx.onrender.com/{TOKEN}")
+    bot.set_webhook(url=f"https://telegram-bot-production-7d43.up.railway.app/{TOKEN}")
     return "Webhook set!", 200
 
 
