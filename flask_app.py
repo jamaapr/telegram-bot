@@ -1,69 +1,28 @@
 import os
-import re
+import io
 import logging
-from datetime import datetime, timezone
 import requests
+import fitz  # PyMuPDF
+from PIL import Image
 import telebot
 from telebot import types
 from flask import Flask, request
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("ValueX")
+logger = logging.getLogger("DocBot")
 
 TOKEN = "8966729910:AAECEcUt0JREMxTYKDzH1wk65A2Ffj6324o"
 BASE_URL = "https://telegram-bot-production-7d43.up.railway.app"
-BRAND_NAME = "ValueX"
+BRAND_NAME = "DocBot"
+OCR_API_KEY = "helloworld"  # Free demo key. Get your own at ocr.space for production use.
 
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 app = Flask(__name__)
 
-FIAT_CURRENCIES = ["USD", "EUR", "GBP", "MAD", "SAR", "AED", "JPY", "CNY"]
+# In-memory state: chat_id -> pending action
+user_state = {}
 
-CRYPTO_ASSETS = {
-    "BTC": "bitcoin",
-    "ETH": "ethereum",
-    "USDT": "tether",
-    "BNB": "binancecoin",
-    "SOL": "solana",
-    "XRP": "ripple",
-    "USDC": "usd-coin",
-    "DOGE": "dogecoin",
-    "ADA": "cardano",
-    "TRX": "tron",
-}
-
-CURRENCY_FLAGS = {
-    "USD": "🇺🇸", "EUR": "🇪🇺", "GBP": "🇬🇧", "MAD": "🇲🇦",
-    "SAR": "🇸🇦", "AED": "🇦🇪", "JPY": "🇯🇵", "CNY": "🇨🇳",
-}
-
-CALC_PATTERN = re.compile(r"^[\d\.\+\-\*\/\(\)\s]+$")
-
-
-# ---------------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------------
-
-def timestamp():
-    return datetime.now(timezone.utc).strftime("%d %b %Y, %H:%M UTC")
-
-
-def divider():
-    return "─" * 24
-
-
-def safe_edit(call, text, markup=None):
-    try:
-        bot.edit_message_text(
-            text,
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=markup,
-            disable_web_page_preview=True,
-        )
-    except Exception as e:
-        logger.warning(f"Edit failed, sending new message instead: {e}")
-        bot.send_message(call.message.chat.id, text, reply_markup=markup)
+STAR_OPTIONS = [1, 15, 25, 50, 100, 250]
 
 
 # ---------------------------------------------------------------------------
@@ -71,39 +30,17 @@ def safe_edit(call, text, markup=None):
 # ---------------------------------------------------------------------------
 
 def kb_main():
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(
-        types.InlineKeyboardButton("💱  Fiat Rates", callback_data="nav:fiat"),
-        types.InlineKeyboardButton("🪙  Crypto Prices", callback_data="nav:crypto"),
-    )
-    kb.add(
-        types.InlineKeyboardButton("🧮  Calculator", callback_data="nav:calc"),
-        types.InlineKeyboardButton("ℹ️  About", callback_data="nav:about"),
-    )
-    return kb
-
-
-def kb_fiat_list():
-    kb = types.InlineKeyboardMarkup(row_width=4)
-    kb.add(*[
-        types.InlineKeyboardButton(f"{CURRENCY_FLAGS.get(c,'')} {c}", callback_data=f"fiat:{c}")
-        for c in FIAT_CURRENCIES
-    ])
-    kb.add(types.InlineKeyboardButton("🏠  Main Menu", callback_data="nav:main"))
-    return kb
-
-
-def kb_crypto_list():
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    kb.add(*[types.InlineKeyboardButton(c, callback_data=f"crypto:{c}") for c in CRYPTO_ASSETS])
-    kb.add(types.InlineKeyboardButton("🏠  Main Menu", callback_data="nav:main"))
-    return kb
-
-
-def kb_result(back_target):
     kb = types.InlineKeyboardMarkup(row_width=1)
-    label = "🔁  Choose Another Currency" if back_target == "fiat" else "🔁  Choose Another Asset"
-    kb.add(types.InlineKeyboardButton(label, callback_data=f"nav:{back_target}"))
+    kb.add(types.InlineKeyboardButton("📄  Extract Text", callback_data="nav:extract"))
+    kb.add(types.InlineKeyboardButton("🔄  Convert Format", callback_data="nav:convert"))
+    kb.add(types.InlineKeyboardButton("💛  Support", callback_data="nav:support"))
+    return kb
+
+
+def kb_convert_menu():
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(types.InlineKeyboardButton("🖼️  Image → PDF", callback_data="conv:img2pdf"))
+    kb.add(types.InlineKeyboardButton("📄  PDF → Image", callback_data="conv:pdf2img"))
     kb.add(types.InlineKeyboardButton("🏠  Main Menu", callback_data="nav:main"))
     return kb
 
@@ -114,193 +51,250 @@ def kb_back_main():
     return kb
 
 
-# ---------------------------------------------------------------------------
-# Data fetchers
-# ---------------------------------------------------------------------------
-
-def fetch_fiat_rates(base):
-    r = requests.get(f"https://open.er-api.com/v6/latest/{base}", timeout=10)
-    r.raise_for_status()
-    data = r.json()
-    if data.get("result") != "success":
-        raise ValueError("API returned an error")
-    return data["rates"]
-
-
-def fetch_crypto_price(symbol):
-    coin_id = CRYPTO_ASSETS[symbol]
-    r = requests.get(
-        "https://api.coingecko.com/api/v3/simple/price",
-        params={
-            "ids": coin_id,
-            "vs_currencies": "usd,eur,mad",
-            "include_24hr_change": "true",
-        },
-        timeout=10,
-    )
-    r.raise_for_status()
-    data = r.json()
-    if coin_id not in data:
-        raise ValueError("Asset not found")
-    return data[coin_id]
+def kb_support():
+    kb = types.InlineKeyboardMarkup(row_width=3)
+    kb.add(*[types.InlineKeyboardButton(f"⭐ {n}", callback_data=f"star:{n}") for n in STAR_OPTIONS])
+    kb.add(types.InlineKeyboardButton("🏠  Main Menu", callback_data="nav:main"))
+    return kb
 
 
 # ---------------------------------------------------------------------------
-# Message builders
+# Text builders
 # ---------------------------------------------------------------------------
 
 def welcome_text(name):
     return (
         f"<b>Welcome to {BRAND_NAME}, {name}.</b>\n"
-        f"{divider()}\n"
-        "Your real-time companion for currency exchange rates "
-        "and cryptocurrency prices.\n\n"
-        "Select an option below to get started."
+        "──────────────────────\n"
+        "Extract text from images and PDFs, or convert "
+        "between image and PDF formats — instantly.\n\n"
+        "Choose an option below."
     )
 
 
-def about_text():
+def extract_prompt_text():
     return (
-        f"<b>{BRAND_NAME}</b>\n"
-        f"{divider()}\n"
-        "A lightweight financial data assistant.\n\n"
-        "💱  <b>Fiat Rates</b> — live exchange rates for 8 major currencies.\n"
-        "🪙  <b>Crypto Prices</b> — live prices for the 10 most traded assets.\n"
-        "🧮  <b>Calculator</b> — quick arithmetic, no app switching.\n\n"
-        "All data is fetched live at the moment of your request."
+        "<b>📄 Extract Text</b>\n"
+        "──────────────────────\n"
+        "Send me a photo or a PDF file, and I'll extract "
+        "the text from it automatically."
     )
 
 
-def calc_text():
+def convert_menu_text():
+    return "<b>🔄 Convert Format</b>\n──────────────────────\nChoose a conversion type:"
+
+
+def img2pdf_prompt_text():
+    return "<b>🖼️ Image → PDF</b>\n──────────────────────\nSend me the image you want to convert."
+
+
+def pdf2img_prompt_text():
+    return "<b>📄 PDF → Image</b>\n──────────────────────\nSend me the PDF file you want to convert."
+
+
+def support_text():
     return (
-        "<b>Calculator</b>\n"
-        f"{divider()}\n"
-        "Send any arithmetic expression directly in the chat, for example:\n\n"
-        "<code>250 * 4</code>\n"
-        "<code>(120 + 80) / 2</code>\n"
-        "<code>15 ** 2</code>"
+        "<b>💛 Support This Bot</b>\n"
+        "──────────────────────\n"
+        "If you find this bot useful, you can support its "
+        "development with Telegram Stars.\n\n"
+        "Choose an amount below:"
     )
 
 
-def fiat_result_text(base, rates):
-    lines = [
-        f"<b>{CURRENCY_FLAGS.get(base,'')} {base} — Exchange Rates</b>",
-        f"🕒 {timestamp()}",
-        divider(),
-    ]
-    for c in FIAT_CURRENCIES:
-        if c == base:
-            continue
-        flag = CURRENCY_FLAGS.get(c, "")
-        lines.append(f"{flag} 1 {base}  =  <b>{rates[c]:.4f}</b> {c}")
-    return "\n".join(lines)
-
-
-def crypto_result_text(symbol, info):
-    change = info.get("usd_24h_change", 0.0)
-    trend = "🟢 ▲" if change >= 0 else "🔴 ▼"
-    lines = [
-        f"<b>🪙 {symbol} — Live Price</b>",
-        f"🕒 {timestamp()}",
-        divider(),
-        f"💵  {info['usd']:,.4f} USD",
-        f"💶  {info.get('eur', 0):,.4f} EUR",
-        f"🇲🇦  {info.get('mad', 0):,.2f} MAD",
-        divider(),
-        f"{trend}  24h change: {change:.2f}%",
-    ]
-    return "\n".join(lines)
-
-
-def error_text(context):
-    return (
-        f"⚠️ <b>Temporarily unavailable</b>\n"
-        f"We couldn't fetch {context} right now. Please try again in a moment."
-    )
+def error_text(msg):
+    return f"⚠️ <b>Something went wrong</b>\n{msg}"
 
 
 # ---------------------------------------------------------------------------
-# Handlers
+# File helpers
+# ---------------------------------------------------------------------------
+
+def download_file(file_id):
+    file_info = bot.get_file(file_id)
+    url = f"https://api.telegram.org/file/bot{TOKEN}/{file_info.file_path}"
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    return r.content
+
+
+def ocr_extract_text(file_bytes, filename):
+    resp = requests.post(
+        "https://api.ocr.space/parse/image",
+        files={"file": (filename, file_bytes)},
+        data={"apikey": OCR_API_KEY, "language": "eng", "isOverlayRequired": False},
+        timeout=60,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("IsErroredOnProcessing"):
+        raise ValueError(data.get("ErrorMessage", ["OCR failed"])[0])
+    parsed = data.get("ParsedResults", [])
+    if not parsed:
+        raise ValueError("No text detected")
+    return parsed[0].get("ParsedText", "").strip()
+
+
+def image_bytes_to_pdf(img_bytes):
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    output = io.BytesIO()
+    img.save(output, format="PDF")
+    output.seek(0)
+    return output
+
+
+def pdf_bytes_to_images(pdf_bytes, max_pages=5):
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    images = []
+    for i, page in enumerate(doc):
+        if i >= max_pages:
+            break
+        pix = page.get_pixmap(dpi=150)
+        buf = io.BytesIO(pix.tobytes("png"))
+        buf.seek(0)
+        images.append(buf)
+    doc.close()
+    return images
+
+
+# ---------------------------------------------------------------------------
+# Navigation handlers
 # ---------------------------------------------------------------------------
 
 @bot.message_handler(commands=["start"])
 def handle_start(message):
-    bot.send_message(
-        message.chat.id,
-        welcome_text(message.from_user.first_name or "there"),
-        reply_markup=kb_main(),
-    )
+    user_state.pop(message.chat.id, None)
+    bot.send_message(message.chat.id, welcome_text(message.from_user.first_name or "there"), reply_markup=kb_main())
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "nav:main")
 def nav_main(call):
-    safe_edit(call, welcome_text(call.from_user.first_name or "there"), kb_main())
+    user_state.pop(call.message.chat.id, None)
+    bot.edit_message_text(welcome_text(call.from_user.first_name or "there"),
+                           call.message.chat.id, call.message.message_id, reply_markup=kb_main())
 
 
-@bot.callback_query_handler(func=lambda c: c.data == "nav:fiat")
-def nav_fiat(call):
-    safe_edit(call, "<b>💱 Select a base currency</b>", kb_fiat_list())
+@bot.callback_query_handler(func=lambda c: c.data == "nav:extract")
+def nav_extract(call):
+    user_state[call.message.chat.id] = "extract"
+    bot.edit_message_text(extract_prompt_text(), call.message.chat.id, call.message.message_id, reply_markup=kb_back_main())
 
 
-@bot.callback_query_handler(func=lambda c: c.data == "nav:crypto")
-def nav_crypto(call):
-    safe_edit(call, "<b>🪙 Select a cryptocurrency</b>", kb_crypto_list())
+@bot.callback_query_handler(func=lambda c: c.data == "nav:convert")
+def nav_convert(call):
+    user_state.pop(call.message.chat.id, None)
+    bot.edit_message_text(convert_menu_text(), call.message.chat.id, call.message.message_id, reply_markup=kb_convert_menu())
 
 
-@bot.callback_query_handler(func=lambda c: c.data == "nav:calc")
-def nav_calc(call):
-    safe_edit(call, calc_text(), kb_back_main())
+@bot.callback_query_handler(func=lambda c: c.data == "conv:img2pdf")
+def nav_img2pdf(call):
+    user_state[call.message.chat.id] = "img2pdf"
+    bot.edit_message_text(img2pdf_prompt_text(), call.message.chat.id, call.message.message_id, reply_markup=kb_back_main())
 
 
-@bot.callback_query_handler(func=lambda c: c.data == "nav:about")
-def nav_about(call):
-    safe_edit(call, about_text(), kb_back_main())
+@bot.callback_query_handler(func=lambda c: c.data == "conv:pdf2img")
+def nav_pdf2img(call):
+    user_state[call.message.chat.id] = "pdf2img"
+    bot.edit_message_text(pdf2img_prompt_text(), call.message.chat.id, call.message.message_id, reply_markup=kb_back_main())
 
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("fiat:"))
-def show_fiat(call):
-    base = call.data.split(":")[1]
+@bot.callback_query_handler(func=lambda c: c.data == "nav:support")
+def nav_support(call):
+    bot.edit_message_text(support_text(), call.message.chat.id, call.message.message_id, reply_markup=kb_support())
+
+
+# ---------------------------------------------------------------------------
+# Telegram Stars payment
+# ---------------------------------------------------------------------------
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("star:"))
+def send_star_invoice(call):
+    amount = int(call.data.split(":")[1])
+    bot.send_invoice(
+        call.message.chat.id,
+        title="Support DocBot",
+        description=f"Thank you for supporting DocBot with {amount} Stars!",
+        invoice_payload=f"support_{amount}",
+        provider_token="",  # Empty for Telegram Stars
+        currency="XTR",
+        prices=[types.LabeledPrice(label="Support", amount=amount)],
+    )
+
+
+@bot.pre_checkout_query_handler(func=lambda q: True)
+def checkout(pre_checkout_q):
+    bot.answer_pre_checkout_query(pre_checkout_q.id, ok=True)
+
+
+@bot.message_handler(content_types=["successful_payment"])
+def payment_success(message):
+    bot.send_message(
+        message.chat.id,
+        "💛 <b>Thank you for your support!</b>\nIt truly helps keep this bot running.",
+        reply_markup=kb_back_main(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# File processing
+# ---------------------------------------------------------------------------
+
+@bot.message_handler(content_types=["photo", "document"])
+def handle_file(message):
+    chat_id = message.chat.id
+    action = user_state.get(chat_id)
+
+    if not action:
+        bot.send_message(chat_id, "Please choose an option from the menu first.", reply_markup=kb_main())
+        return
+
     try:
-        rates = fetch_fiat_rates(base)
-        text = fiat_result_text(base, rates)
-    except Exception as e:
-        logger.error(f"Fiat fetch failed: {e}")
-        text = error_text("exchange rates")
-    safe_edit(call, text, kb_result("fiat"))
+        if message.content_type == "photo":
+            file_id = message.photo[-1].file_id
+            filename = "image.jpg"
+        else:
+            file_id = message.document.file_id
+            filename = message.document.file_name or "file"
 
+        file_bytes = download_file(file_id)
+        processing_msg = bot.send_message(chat_id, "⏳ Processing...")
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("crypto:"))
-def show_crypto(call):
-    symbol = call.data.split(":")[1]
-    try:
-        info = fetch_crypto_price(symbol)
-        text = crypto_result_text(symbol, info)
+        if action == "extract":
+            text = ocr_extract_text(file_bytes, filename)
+            result = text if text else "No text was detected in this file."
+            bot.edit_message_text(f"<b>📄 Extracted Text</b>\n──────────────────────\n{result}",
+                                   chat_id, processing_msg.message_id)
+            bot.send_message(chat_id, "What would you like to do next?", reply_markup=kb_main())
+
+        elif action == "img2pdf":
+            pdf_buf = image_bytes_to_pdf(file_bytes)
+            bot.delete_message(chat_id, processing_msg.message_id)
+            bot.send_document(chat_id, pdf_buf, visible_file_name="converted.pdf",
+                               caption="✅ Here's your PDF.")
+            bot.send_message(chat_id, "What would you like to do next?", reply_markup=kb_main())
+
+        elif action == "pdf2img":
+            images = pdf_bytes_to_images(file_bytes)
+            bot.delete_message(chat_id, processing_msg.message_id)
+            if not images:
+                bot.send_message(chat_id, "⚠️ Could not read this PDF.")
+            else:
+                for idx, img_buf in enumerate(images, start=1):
+                    bot.send_photo(chat_id, img_buf, caption=f"Page {idx}/{len(images)}")
+                bot.send_message(chat_id, "✅ Conversion complete. What's next?", reply_markup=kb_main())
+
     except Exception as e:
-        logger.error(f"Crypto fetch failed: {e}")
-        text = error_text("this asset's price")
-    safe_edit(call, text, kb_result("crypto"))
+        logger.error(f"Processing failed: {e}")
+        bot.send_message(chat_id, error_text("Please try again with a different file."), reply_markup=kb_main())
+
+    finally:
+        user_state.pop(chat_id, None)
 
 
 @bot.message_handler(func=lambda m: True, content_types=["text"])
 def handle_text(message):
-    text = message.text.strip()
-
-    if CALC_PATTERN.match(text) and any(ch.isdigit() for ch in text):
-        try:
-            result = eval(text, {"__builtins__": {}}, {})
-            bot.send_message(
-                message.chat.id,
-                f"🧮 <code>{text}</code>  =  <b>{result}</b>",
-            )
-        except Exception:
-            bot.send_message(message.chat.id, "⚠️ That expression couldn't be calculated.")
-        return
-
-    bot.send_message(
-        message.chat.id,
-        welcome_text(message.from_user.first_name or "there"),
-        reply_markup=kb_main(),
-    )
+    bot.send_message(message.chat.id, welcome_text(message.from_user.first_name or "there"), reply_markup=kb_main())
 
 
 # ---------------------------------------------------------------------------
